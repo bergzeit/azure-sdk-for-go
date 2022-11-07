@@ -9,6 +9,7 @@ package shared
 import (
 	"context"
 	"errors"
+	"sync"
 )
 
 // BatchTransferOptions identifies options used by doBatchTransfer.
@@ -34,19 +35,45 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 	// Prepare and do parallel operations.
 	numChunks := uint16(((o.TransferSize - 1) / o.ChunkSize) + 1)
 	operationChannel := make(chan func() error, o.Concurrency) // Create the channel that release 'concurrency' goroutines concurrently
-	operationResponseChannel := make(chan error, numChunks)    // Holds each response
+	operationResponseChannel := make(chan error)               // Listen for operation responses and react to them
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Create the goroutines that process each operation (in parallel).
+	// Create a background listener to the error channel. As soon as one error
+	// is returned from an operation cancel all remaining operations and return
+	// this first error.
+	var firstErr error = nil
+	errWg := sync.WaitGroup{}
+	errWg.Add(1) // TODO: we need to check if the return works when an error occurs and if it works if not
+	go func(wg *sync.WaitGroup) {
+		defer cancel()
+		defer wg.Done()
+
+		for err := range operationResponseChannel {
+			// record the first error (the original error which should cause the other chunks to fail with canceled context)
+			if err != nil && firstErr == nil {
+				firstErr = err
+				cancel() // As soon as any operation fails, cancel all remaining operation calls
+				break    // Break the loop, call possible defer and end the routine
+			}
+		}
+	}(&errWg)
+
+	// Create the goroutines that process each operation (in parallel). Using
+	// the wait groups to prevent race conditions when the channel is closed later
+	wg := sync.WaitGroup{}
 	for g := uint16(0); g < o.Concurrency; g++ {
-		//grIndex := g
-		go func() {
+		// One increment per routine because we want all operations to finish
+		// before moving on when the listening channel closes
+		wg.Add(1)
+		go func(wg *sync.WaitGroup) {
+			defer wg.Done()
+
 			for f := range operationChannel {
 				err := f()
 				operationResponseChannel <- err
 			}
-		}()
+		}(&wg)
 	}
 
 	// Add each chunk's operation to the channel.
@@ -62,17 +89,11 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 			return o.Operation(offset, curChunkSize, ctx)
 		}
 	}
-	close(operationChannel)
+	close(operationChannel) // All operations were sent to the channel
+	wg.Wait()               // Wait for all go routines to finish their work
 
-	// Wait for the operations to complete.
-	var firstErr error = nil
-	for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
-		responseError := <-operationResponseChannel
-		// record the first error (the original error which should cause the other chunks to fail with canceled context)
-		if responseError != nil && firstErr == nil {
-			cancel() // As soon as any operation fails, cancel all remaining operation calls
-			firstErr = responseError
-		}
-	}
+	close(operationResponseChannel) // All sending go routines to the channel are done, the channel is safe to close
+	errWg.Wait()                    // Close the response channel and wait for the worker to finish
+
 	return firstErr
 }
