@@ -53,7 +53,6 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 			// record the first error (the original error which should cause the other chunks to fail with canceled context)
 			if err != nil && firstErr == nil {
 				firstErr = err
-				cancel() // As soon as any operation fails, cancel all remaining operation calls
 				break    // Break the loop, call possible defer and end the routine
 			}
 		}
@@ -78,6 +77,12 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 
 	// Add each chunk's operation to the channel.
 	for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
+		if firstErr != nil {
+			// As soon as the first error occurs do not write any more jobs
+			// because we want to return the first error of the func
+			break 
+		}
+
 		curChunkSize := o.ChunkSize
 
 		if chunkNum == numChunks-1 { // Last chunk
@@ -90,10 +95,10 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 		}
 	}
 	close(operationChannel) // All operations were sent to the channel
-	wg.Wait()               // Wait for all go routines to finish their work
+	wg.Wait()               // Wait for all worker go routines to finish their work
 
-	close(operationResponseChannel) // All sending go routines to the channel are done, the channel is safe to close
-	errWg.Wait()                    // Close the response channel and wait for the worker to finish
+	close(operationResponseChannel) // All sending go routines to the channel are done, the channel is now safe to close
+	errWg.Wait()                    // Wait for the error worker to finish
 
 	return firstErr
 }
