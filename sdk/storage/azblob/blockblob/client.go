@@ -340,10 +340,10 @@ func (bb *Client) uploadFromReader(ctx context.Context, reader io.ReaderAt, read
 		if readerSize <= MaxUploadBlobBytes {
 			o.BlockSize = MaxUploadBlobBytes // Default if unspecified
 		} else {
-			if remainder := readerSize % MaxBlocks; remainder > 0 {
-				// ensure readerSize is a multiple of MaxBlocks
-				readerSize += (MaxBlocks - remainder)
-			}
+			// if remainder := readerSize % MaxBlocks; remainder > 0 {
+			// 	// ensure readerSize is a multiple of MaxBlocks
+			// 	// readerSize += (MaxBlocks - remainder)
+			// }
 			o.BlockSize = readerSize / MaxBlocks             // buffer / max blocks = block size to use all 50,000 blocks
 			if o.BlockSize < blob.DefaultDownloadBlockSize { // If the block size is smaller than 4MB, round up to 4MB
 				o.BlockSize = blob.DefaultDownloadBlockSize
