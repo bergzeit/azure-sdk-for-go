@@ -35,7 +35,7 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 	// Prepare and do parallel operations.
 	numChunks := uint16(((o.TransferSize - 1) / o.ChunkSize) + 1)
 	operationChannel := make(chan func() error, o.Concurrency) // Create the channel that release 'concurrency' goroutines concurrently
-	operationResponseChannel := make(chan error)               // Listen for operation responses and react to them
+	operationResponseChannel := make(chan error)               // Receives error responses from operations
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -46,14 +46,14 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 	errWg := sync.WaitGroup{}
 	errWg.Add(1) // TODO: we need to check if the return works when an error occurs and if it works if not
 	go func(wg *sync.WaitGroup) {
-		defer cancel()
+		defer cancel() // Cancel all operations still running, has practically no effect in a positive path but closing the context
 		defer wg.Done()
 
 		for err := range operationResponseChannel {
-			// record the first error (the original error which should cause the other chunks to fail with canceled context)
+			// Record the first error (the original error which should cause the other chunks to fail with canceled context)
 			if err != nil && firstErr == nil {
 				firstErr = err
-				break    // Break the loop, call possible defer and end the routine
+				break // Discovered the first error and we can end all operations
 			}
 		}
 	}(&errWg)
@@ -69,8 +69,7 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 			defer wg.Done()
 
 			for f := range operationChannel {
-				err := f()
-				operationResponseChannel <- err
+				operationResponseChannel <- f()
 			}
 		}(&wg)
 	}
@@ -79,8 +78,8 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 	for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
 		if firstErr != nil {
 			// As soon as the first error occurs do not write any more jobs
-			// because we want to return the first error of the func
-			break 
+			// because we want to return the first error of the func to the caller
+			break
 		}
 
 		curChunkSize := o.ChunkSize
@@ -95,7 +94,7 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 		}
 	}
 	close(operationChannel) // All operations were sent to the channel
-	wg.Wait()               // Wait for all worker go routines to finish their work
+	wg.Wait()               // Wait gracefully for all worker go routines to finish their work
 
 	close(operationResponseChannel) // All sending go routines to the channel are done, the channel is now safe to close
 	errWg.Wait()                    // Wait for the error worker to finish
