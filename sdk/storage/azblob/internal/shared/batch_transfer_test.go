@@ -90,21 +90,21 @@ func TestDoBatchTransferError(t *testing.T) {
 func errorOperation(offset int64, chunkSize int64, ctx context.Context) error {
 	//log.Printf("test: processing offset: %d", offset)
 
-	//select {
-	//case <-ctx.Done():
-	////	log.Printf("test: context-cancelled: worker received done signal: %d", offset)
-	//	return errors.New("cancelled operation")
-	//default:
-	tr.Lock()
-	defer tr.Unlock()
-	tr.value += chunkSize
-	//atomic.AddInt64(&transferred, chunkSize)
+	select {
+	case <-ctx.Done():
+		log.Printf("test: context-cancelled: worker received done signal: %d", offset)
+		return errors.New("cancelled operation")
+	default:
+		tr.Lock()
+		defer tr.Unlock()
+		tr.value += chunkSize
+		//atomic.AddInt64(&transferred, chunkSize)
 
-	if tr.value >= breakSize {
-		log.Printf("test: break-size exceeded: transferred: %d, which is more than %d", tr.value, breakSize)
-		//log.Print("test: break-size exceeded: throw error")
-		return errors.New("transferred enough data")
+		if tr.value >= breakSize {
+			//log.Printf("test: break-size exceeded: transferred: %d, which is more than %d", tr.value, breakSize)
+			//log.Print("test: break-size exceeded: throw error")
+			return errors.New("transferred enough data")
+		}
 	}
-	//}
 	return nil
 }
