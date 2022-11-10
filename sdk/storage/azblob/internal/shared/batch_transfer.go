@@ -22,6 +22,11 @@ type BatchTransferOptions struct {
 	OperationName string
 }
 
+type firstError struct {
+	lock  *sync.RWMutex
+	error error
+}
+
 // DoBatchTransfer helps to execute operations in a batch manner.
 // Can be used by users to customize batch works (for other scenarios that the SDK does not provide)
 func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
@@ -43,7 +48,9 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 	// Create a background listener to the error channel. As soon as one error
 	// is returned from an operation cancel all remaining operations and return
 	// this first error.
-	var firstErr error = nil
+	firstErr := firstError{
+		lock: &sync.RWMutex{},
+	}
 
 	// Create the goroutines that process each operation (in parallel). Using
 	// the wait groups to prevent race conditions when the channel is closed later
@@ -52,20 +59,33 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 		// One increment per routine because we want all operations to finish
 		// before moving on when the listening channel closes
 		wg.Add(1)
-		go func(wg *sync.WaitGroup, ops <-chan func() error, opResponses chan error, id uint16) {
+		go func(wg *sync.WaitGroup, ops <-chan func() error, opErrs chan error, id uint16, fe *firstError) {
 			defer func() {
-				log.Printf("closing worker %d", id)
+				log.Printf("worker #%d: closing", id)
 				wg.Done()
+				cancel()
 			}()
 
-			log.Printf("start worker %d", id)
+			log.Printf("worker #%d: start", id)
 
 			for {
 				select {
 				case <-ctx.Done():
+					log.Printf("worker #%d: canceled by context", id)
 					return
-				case err := <-opResponses:
-					firstErr = err
+				case err := <-opErrs:
+					// did we set an error already?
+					//fe.lock.RLock()
+					//if fe.error != nil {
+					//	fe.lock.RUnlock()
+					//	return
+					//}
+					// if not, we can set one
+					fe.lock.Lock()
+					defer fe.lock.Unlock()
+					fe.error = err
+					log.Printf("worker #%d: routine error: %v", id, err)
+					cancel()
 					return
 				case f, ok := <-ops:
 					if !ok {
@@ -73,42 +93,49 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 					}
 					err := f()
 					if err != nil {
-						log.Printf("sending err: %v", err)
-						opResponses <- err
+						log.Printf("worker #%d: sending err: %v", id, err)
+						opErrs <- err
 					}
 				}
 			}
-		}(&wg, ops, opErrors, g)
+		}(&wg, ops, opErrors, g, &firstErr)
 	}
 
+	var mainWg sync.WaitGroup
+	mainWg.Add(1)
 	// Add each chunk's operation to the channel.
-	for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
-		if firstErr != nil {
-			// As soon as the first error occurs do not write any more jobs
-			// because we want to return the first error of the func to the caller
-			break
-		}
-		curChunkSize := o.ChunkSize
+	go func(ctx context.Context, wg *sync.WaitGroup) {
+		defer wg.Done()
+		for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
+			select {
+			case <-ctx.Done():
+				log.Print("batch-main: stop sending jobs, due to context-cancel")
+				return
+			default:
+				curChunkSize := o.ChunkSize
 
-		if chunkNum == numChunks-1 { // Last chunk
-			curChunkSize = o.TransferSize - (int64(chunkNum) * o.ChunkSize) // Remove size of all transferred chunks from total
-		}
-		offset := int64(chunkNum) * o.ChunkSize
+				if chunkNum == numChunks-1 { // Last chunk
+					curChunkSize = o.TransferSize - (int64(chunkNum) * o.ChunkSize) // Remove size of all transferred chunks from total
+				}
+				offset := int64(chunkNum) * o.ChunkSize
 
-		// This is a closure capturing the parameters and sending the operation to
-		// the workers
-		log.Printf("send to ops channel, chunkNum: %d out of %d chunks", chunkNum, numChunks)
-		ops <- func() error {
-			return o.Operation(offset, curChunkSize, ctx)
+				// This is a closure capturing the parameters and sending the operation to
+				// the workers
+				log.Printf("batch-main: send to ops channel, chunkNum: %d out of %d chunks", chunkNum, numChunks)
+				ops <- func() error {
+					return o.Operation(offset, curChunkSize, ctx)
+				}
+			}
 		}
-	}
+	}(ctx, &mainWg)
 
-	log.Print("closing ops channel")
+	mainWg.Wait()
+	log.Print("batch-main: closing ops channel")
 	close(ops) // All operations were sent to the channel
 	wg.Wait()  // Wait gracefully for all worker go routines to finish their work
 
-	log.Print("closing opResponses channel")
+	log.Print("batch-main: closing opResponses channel")
 	close(opErrors) // All sending go routines to the channel are done, the channel is now safe to close
 
-	return firstErr
+	return firstErr.error
 }

@@ -4,11 +4,17 @@ import (
 	"context"
 	"errors"
 	"log"
-	"sync/atomic"
+	"sync"
 	"testing"
 )
 
-var transferred int64
+type transferred struct {
+	sync.Mutex
+	value int64
+}
+
+var tr transferred = transferred{}
+
 var transferSize int64 = int64(100_000)
 var breakSize int64 = int64(20_000)
 
@@ -24,26 +30,33 @@ func TestDoBatchTransfer(t *testing.T) {
 	}
 
 	// when executing the batch-transfer
-	DoBatchTransfer(context.Background(), &bto)
+	err := DoBatchTransfer(context.Background(), &bto)
+	if err != nil {
+		t.Logf("expected no error, but got: %v", err)
+	}
 
 	// then our sentinels reflect the operation
-	if transferred != transferSize {
-		t.Logf("transferred: %d, wanted to transfer: %d", transferred, transferSize)
+	if tr.value != transferSize {
+		t.Logf("transferred: %d, wanted to transfer: %d", tr.value, transferSize)
 		t.Fail()
 	}
 }
 
 func successOperation(offset int64, chunkSize int64, ctx context.Context) error {
-	atomic.AddInt64(&transferred, chunkSize)
+	tr.Lock()
+	tr.value += chunkSize
+	tr.Unlock()
 	return nil
 }
 
 func TestDoBatchTransferError(t *testing.T) {
 	// given a BatchTransferOptions
 	// with an operation that mutates our sentinels
+	chunkSize := int64(5_000)
+
 	bto := BatchTransferOptions{
 		TransferSize:  transferSize,
-		ChunkSize:     int64(5_000),
+		ChunkSize:     chunkSize,
 		Concurrency:   5,
 		Operation:     errorOperation,
 		OperationName: "error-operation",
@@ -62,29 +75,36 @@ func TestDoBatchTransferError(t *testing.T) {
 		t.Log("expected err: \"transferred enough data\", but got nil")
 	}
 
-	if transferred > transferSize+int64(10_000) {
-		t.Logf("expected no more than %d, but got %d", breakSize, transferred)
+	if tr.value > transferSize-breakSize {
+		t.Logf("expected no more than %d, but got %d", transferSize-breakSize, tr.value)
+		t.Fail()
+	}
+
+	if tr.value > transferSize+int64(10_000) {
+		t.Logf("expected no more than %d, but got %d", breakSize, tr.value)
 		t.Fail()
 	}
 
 }
 
 func errorOperation(offset int64, chunkSize int64, ctx context.Context) error {
-	log.Printf("processing offset: %d", offset)
+	//log.Printf("test: processing offset: %d", offset)
 
-	// /time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
+	//select {
+	//case <-ctx.Done():
+	////	log.Printf("test: context-cancelled: worker received done signal: %d", offset)
+	//	return errors.New("cancelled operation")
+	//default:
+	tr.Lock()
+	defer tr.Unlock()
+	tr.value += chunkSize
+	//atomic.AddInt64(&transferred, chunkSize)
 
-	select {
-	case <-ctx.Done():
-		log.Printf("worker received done signal: %d", offset)
-		return errors.New("cancelled operation")
-	default:
-		atomic.AddInt64(&transferred, chunkSize)
-		if transferred >= breakSize {
-			log.Printf("transferred: %d, which is more than %d", transferred, breakSize)
-			log.Print("throw error")
-			return errors.New("transferred enough data")
-		}
+	if tr.value >= breakSize {
+		log.Printf("test: break-size exceeded: transferred: %d, which is more than %d", tr.value, breakSize)
+		//log.Print("test: break-size exceeded: throw error")
+		return errors.New("transferred enough data")
 	}
+	//}
 	return nil
 }
