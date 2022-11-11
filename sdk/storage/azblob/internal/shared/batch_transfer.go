@@ -121,9 +121,11 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 	go func(opErrs <-chan error, fe *firstError, wg *sync.WaitGroup) {
 		defer wg.Done()
 		for err := range opErrs {
+			fe.lock.RLock()
 			if fe.error != nil {
 				continue
 			}
+			fe.lock.RUnlock()
 			log.Printf("batch-main: received error: %v", err)
 			fe.lock.Lock()
 			fe.error = err
