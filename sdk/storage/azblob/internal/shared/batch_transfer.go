@@ -59,7 +59,7 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 		// One increment per routine because we want all operations to finish
 		// before moving on when the listening channel closes
 		wg.Add(1)
-		go func(wg *sync.WaitGroup, ops <-chan func() error, opErrs chan<- error, id uint16, fe *firstError) {
+		go func(ctx context.Context, wg *sync.WaitGroup, ops <-chan func() error, opErrs chan<- error, id uint16, fe *firstError) {
 			defer func() {
 				log.Printf("worker #%d: closing", id)
 				wg.Done()
@@ -67,32 +67,30 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 
 			log.Printf("worker #%d: start", id)
 
-			for {
-				select {
-				case <-ctx.Done():
-					log.Printf("worker #%d: canceled by context", id)
-					return
-				case f, ok := <-ops:
-					if !ok {
-						return
-					}
-					err := f()
-					if err != nil {
-						log.Printf("worker #%d: sending err: %v", id, err)
-						opErrs <- err
-					} else {
-						log.Printf("worker #%d: success", id)
-					}
+			for f := range ops {
+				err := f()
+				if err != nil {
+					log.Printf("worker #%d: sending err: %v", id, err)
+					opErrs <- err
+				} else {
+					log.Printf("worker #%d: success", id)
 				}
+				//case <-ctx.Done():
+				//	log.Printf("worker #%d: canceled by context", id)
+				//	return
 			}
-		}(&wg, ops, opErrors, g, &firstErr)
+		}(ctx, &wg, ops, opErrors, g, &firstErr)
 	}
 
 	var mainWg sync.WaitGroup
 	mainWg.Add(1)
 	// Add each chunk's operation to the channel.
 	go func(ctx context.Context, op chan func() error, wg *sync.WaitGroup) {
-		defer wg.Done()
+		defer func() {
+			close(op) // All operations were sent to the channel
+			wg.Done()
+		}()
+
 		for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
 			select {
 			case <-ctx.Done():
@@ -137,8 +135,7 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 
 	mainWg.Wait()
 	log.Print("batch-main: closing ops channel")
-	close(ops) // All operations were sent to the channel
-	wg.Wait()  // Wait gracefully for all worker go routines to finish their work
+	wg.Wait() // Wait gracefully for all worker go routines to finish their work
 
 	log.Print("batch-main: closing opResponses channel")
 	close(opErrors) // All sending go routines to the channel are done, the channel is now safe to close
