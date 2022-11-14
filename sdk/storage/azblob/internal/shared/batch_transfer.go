@@ -9,6 +9,7 @@ package shared
 import (
 	"context"
 	"errors"
+	"sync"
 )
 
 // BatchTransferOptions identifies options used by doBatchTransfer.
@@ -18,6 +19,11 @@ type BatchTransferOptions struct {
 	Concurrency   uint16
 	Operation     func(offset int64, chunkSize int64, ctx context.Context) error
 	OperationName string
+}
+
+type firstError struct {
+	*sync.Mutex
+	error error
 }
 
 // DoBatchTransfer helps to execute operations in a batch manner.
@@ -33,46 +39,92 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 
 	// Prepare and do parallel operations.
 	numChunks := uint16(((o.TransferSize - 1) / o.ChunkSize) + 1)
-	operationChannel := make(chan func() error, o.Concurrency) // Create the channel that release 'concurrency' goroutines concurrently
-	operationResponseChannel := make(chan error, numChunks)    // Holds each response
+	ops := make(chan func() error, o.Concurrency) // Create the channel that release 'concurrency' goroutines concurrently
+	opErrors := make(chan error)                  // Receives error responses from operations
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Create the goroutines that process each operation (in parallel).
+	// an instance for the first error ever occured in a worker
+	firstErr := firstError{
+		&sync.Mutex{},
+		nil,
+	}
+
+	// Create the goroutines that process each operation (in parallel). Using
+	// the wait groups to prevent race conditions when the channel is closed later
+	// Worker routines are done, when the ops channel is closed.
+	wg := sync.WaitGroup{}
 	for g := uint16(0); g < o.Concurrency; g++ {
-		//grIndex := g
-		go func() {
-			for f := range operationChannel {
+		// One increment per routine because we want all operations to finish
+		// before moving on when the listening channel closes
+		wg.Add(1)
+		go func(wg *sync.WaitGroup, ops <-chan func() error, opErrs chan<- error) {
+			defer wg.Done()
+
+			for f := range ops {
 				err := f()
-				operationResponseChannel <- err
+				if err != nil {
+					opErrs <- err
+				}
 			}
-		}()
+		}(&wg, ops, opErrors)
 	}
 
 	// Add each chunk's operation to the channel.
-	for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
-		curChunkSize := o.ChunkSize
+	wg.Add(1)
+	go func(ctx context.Context, op chan func() error, wg *sync.WaitGroup) {
+		defer func() {
+			close(op) // All operations were sent to the channel, so the workers are done
+			wg.Done()
+		}()
 
-		if chunkNum == numChunks-1 { // Last chunk
-			curChunkSize = o.TransferSize - (int64(chunkNum) * o.ChunkSize) // Remove size of all transferred chunks from total
-		}
-		offset := int64(chunkNum) * o.ChunkSize
+		for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				curChunkSize := o.ChunkSize
 
-		operationChannel <- func() error {
-			return o.Operation(offset, curChunkSize, ctx)
-		}
-	}
-	close(operationChannel)
+				if chunkNum == numChunks-1 { // Last chunk
+					curChunkSize = o.TransferSize - (int64(chunkNum) * o.ChunkSize) // Remove size of all transferred chunks from total
+				}
+				offset := int64(chunkNum) * o.ChunkSize
 
-	// Wait for the operations to complete.
-	var firstErr error = nil
-	for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
-		responseError := <-operationResponseChannel
-		// record the first error (the original error which should cause the other chunks to fail with canceled context)
-		if responseError != nil && firstErr == nil {
-			cancel() // As soon as any operation fails, cancel all remaining operation calls
-			firstErr = responseError
+				// This is a closure capturing the parameters and sending the operation to
+				// the workers
+				ops <- func() error {
+					return o.Operation(offset, curChunkSize, ctx)
+				}
+			}
 		}
-	}
-	return firstErr
+	}(ctx, ops, &wg)
+
+	// reading the errors returned from the workers, so that we can get
+	// the first error thrown and save it as return value
+	var errWg sync.WaitGroup
+	errWg.Add(1)
+	go func(opErrs <-chan error, fe *firstError, wg *sync.WaitGroup) {
+		defer wg.Done()
+		for err := range opErrs {
+			// hard locking the error
+			fe.Lock()
+			// if we've catched an error already, we continue
+			// thus ensure, the error channel is emptied
+			if fe.error != nil {
+				fe.Unlock()
+				continue
+			}
+			fe.error = err
+			fe.Unlock()
+			cancel()
+		}
+	}(opErrors, &firstErr, &errWg)
+
+	wg.Wait() // Wait gracefully for all worker go routines to finish their work
+
+	close(opErrors) // All sending go routines to the channel are done, the channel is now safe to close
+
+	errWg.Wait()
+
+	return firstErr.error
 }
