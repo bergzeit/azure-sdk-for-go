@@ -23,7 +23,7 @@ type BatchTransferOptions struct {
 }
 
 type firstError struct {
-	lock  *sync.RWMutex
+	lock  *sync.Mutex
 	error error
 }
 
@@ -45,15 +45,14 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Create a background listener to the error channel. As soon as one error
-	// is returned from an operation cancel all remaining operations and return
-	// this first error.
+	// an instance for the first error ever occured in a worker
 	firstErr := firstError{
-		lock: &sync.RWMutex{},
+		lock: &sync.Mutex{},
 	}
 
 	// Create the goroutines that process each operation (in parallel). Using
 	// the wait groups to prevent race conditions when the channel is closed later
+	// Worker routines are done, when the ops channel is closed.
 	wg := sync.WaitGroup{}
 	for g := uint16(0); g < o.Concurrency; g++ {
 		// One increment per routine because we want all operations to finish
@@ -75,19 +74,16 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 				} else {
 					log.Printf("worker #%d: success", id)
 				}
-				//case <-ctx.Done():
-				//	log.Printf("worker #%d: canceled by context", id)
-				//	return
 			}
 		}(ctx, &wg, ops, opErrors, g, &firstErr)
 	}
 
+	// Add each chunk's operation to the channel.
 	var mainWg sync.WaitGroup
 	mainWg.Add(1)
-	// Add each chunk's operation to the channel.
 	go func(ctx context.Context, op chan func() error, wg *sync.WaitGroup) {
 		defer func() {
-			close(op) // All operations were sent to the channel
+			close(op) // All operations were sent to the channel, so the workers are done
 			wg.Done()
 		}()
 
@@ -114,21 +110,24 @@ func DoBatchTransfer(ctx context.Context, o *BatchTransferOptions) error {
 		}
 	}(ctx, ops, &mainWg)
 
+	// reading the errors returned from the workers, so that we can get
+	// the first error thrown and save it as return value
 	var errWg sync.WaitGroup
 	errWg.Add(1)
 	go func(opErrs <-chan error, fe *firstError, wg *sync.WaitGroup) {
 		defer wg.Done()
 		for err := range opErrs {
-			fe.lock.RLock()
+			// hard locking the error
+			fe.lock.Lock()
+			// if we've catched an error already, we continue
+			// thus ensure, the error channel is emptied
 			if fe.error != nil {
+				fe.lock.Unlock()
 				continue
 			}
-			fe.lock.RUnlock()
 			log.Printf("batch-main: received error: %v", err)
-			fe.lock.Lock()
 			fe.error = err
 			fe.lock.Unlock()
-			log.Printf("batch-main: routine error: %v", err)
 			cancel()
 		}
 	}(opErrors, &firstErr, &errWg)
